@@ -132,6 +132,141 @@ function backupStore() {
   fs.copyFileSync(MEMORIES, file);
   return file;
 }
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function dosTime(date = new Date()) {
+  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const year = Math.max(1980, date.getFullYear());
+  const day = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { time, day };
+}
+function zipBuffer(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name.replace(/^\/+/, '').replace(/\\/g, '/'), 'utf8');
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(String(entry.data ?? ''), 'utf8');
+    const statDate = entry.date || new Date();
+    const stamp = dosTime(statDate);
+    const crc = crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(stamp.time, 10);
+    local.writeUInt16LE(stamp.day, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, name, data);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(stamp.time, 12);
+    central.writeUInt16LE(stamp.day, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, name);
+    offset += local.length + name.length + data.length;
+  }
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, ...centralParts, end]);
+}
+function collectFiles(root, prefix, entries, maxFiles = 1000) {
+  if (!fs.existsSync(root) || entries.length >= maxFiles) return;
+  for (const item of fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const file = path.join(root, item.name);
+    const relative = `${prefix}/${item.name}`;
+    if (item.isDirectory()) collectFiles(file, relative, entries, maxFiles);
+    else if (item.isFile()) entries.push({ name: relative, data: fs.readFileSync(file), date: fs.statSync(file).mtime });
+  }
+}
+function memoryExportZip() {
+  syncMarkdown();
+  const store = loadStore();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const entries = [
+    {
+      name: 'manifest.json',
+      data: JSON.stringify({
+        name: 'Horizon Context Memory export',
+        schema: 1,
+        exportedAt: nowIso(),
+        memories: store.memories.length,
+        userMemories: store.memories.filter(memory => memory.domain === 'user').length,
+        projectMemories: store.memories.filter(memory => memory.domain === 'memory').length,
+        disabledMemories: store.memories.filter(memory => memory.status === 'disabled').length,
+      }, null, 2) + '\n',
+    },
+    {
+      name: 'README_IMPORT.txt',
+      data: [
+        'Horizon Context Memory export',
+        '',
+        'To migrate manually:',
+        '1. Install HCM on the target machine.',
+        '2. Stop the target HCM web server if it is running.',
+        '3. Copy data/* into ~/.codex/hcm/data/ and skills/* into ~/.codex/hcm/skills/ when present.',
+        '4. Run hcm and verify the memory count in the web cockpit.',
+        '',
+        'This archive may contain private memories, event snippets, audit history, and local workflow notes. Treat it as sensitive local data.',
+        '',
+      ].join('\n'),
+    },
+  ];
+  for (const [source, name] of [
+    [MEMORIES, 'data/memories.json'],
+    [USER_MD, 'data/USER.md'],
+    [MEMORY_MD, 'data/MEMORY.md'],
+    [CONFIG, 'config.json'],
+    [AUDIT, 'data/audit.jsonl'],
+    [AUTO_MAINTENANCE, 'data/web-auto-maintenance.json'],
+    [path.join(DATA, 'auto-state.json'), 'data/auto-state.json'],
+    [path.join(DATA, 'sessions.sqlite'), 'data/sessions.sqlite'],
+  ]) {
+    if (fs.existsSync(source)) entries.push({ name, data: fs.readFileSync(source), date: fs.statSync(source).mtime });
+  }
+  collectFiles(path.join(DATA, 'events'), 'data/events', entries);
+  collectFiles(path.join(DATA, 'backups'), 'data/backups', entries);
+  collectFiles(path.join(ROOT, 'skills', 'proposals'), 'skills/proposals', entries);
+  return { filename: `hcm-memory-export-${stamp}.zip`, buffer: zipBuffer(entries) };
+}
 function pendingBucket(memory) {
   if (memory.status === 'disabled') return 'disabled';
   if (memory.review === 'auto-candidate') return 'candidate';
@@ -275,6 +410,15 @@ function send(res, code, data, type = 'application/json') {
   res.writeHead(code, { 'content-type': `${type}; charset=utf-8`, 'cache-control': 'no-store' });
   res.end(type === 'application/json' ? JSON.stringify(data) : data);
 }
+function sendDownload(res, filename, buffer) {
+  res.writeHead(200, {
+    'content-type': 'application/zip',
+    'content-length': buffer.length,
+    'content-disposition': `attachment; filename="${filename}"`,
+    'cache-control': 'no-store',
+  });
+  res.end(buffer);
+}
 function body(req) { return new Promise(resolve => { let raw = ''; req.on('data', c => raw += c); req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); } }); }); }
 function html() { return fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8'); }
 function openBrowser(url) {
@@ -304,6 +448,14 @@ function existingServerLooksHealthy(url) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === 'GET' && url.pathname === '/') return send(res, 200, html(), 'text/html');
+  if (req.method === 'GET' && url.pathname === '/api/export.zip') {
+    try {
+      const archive = memoryExportZip();
+      return sendDownload(res, archive.filename, archive.buffer);
+    } catch (error) {
+      return send(res, 500, { ok: false, error: error.message });
+    }
+  }
   if (req.method === 'GET' && url.pathname === '/api/state') {
     syncMarkdown();
     startAutoMaintenance();
