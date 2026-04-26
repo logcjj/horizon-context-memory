@@ -2,6 +2,14 @@
 ROOT="${HCM_HOME:-$HOME/.codex/hcm}"
 LINE='export PATH="${HCM_HOME:-$HOME/.codex/hcm}/bin:$PATH"'
 SHELL_RC="$HOME/.zshrc"
+LOCAL_BIN="$HOME/.local/bin"
+mkdir -p "$LOCAL_BIN"
+rm -f "$LOCAL_BIN/hcm"
+cat > "$LOCAL_BIN/hcm" <<'EOF'
+#!/bin/sh
+exec "$HOME/.codex/hcm/bin/hcm" "$@"
+EOF
+chmod +x "$LOCAL_BIN/hcm"
 if [ -f "$SHELL_RC" ]; then
   SHELL_RC="$SHELL_RC" node <<'NODE'
 const fs = require('fs');
@@ -21,3 +29,4 @@ fi
 printf '\n# Horizon Context Memory memory manager\n%s\n' "$LINE" >> "$SHELL_RC"
 echo "Configured hcm PATH in $SHELL_RC. Restart terminal or run:"
 echo "$LINE"
+echo "Linked hcm at $LOCAL_BIN/hcm"
