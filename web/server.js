@@ -281,6 +281,25 @@ function openBrowser(url) {
   if (process.argv.includes('--no-open')) return;
   if (process.platform === 'darwin') spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
 }
+function existingServerLooksHealthy(url) {
+  try {
+    execFileSync(process.execPath, ['-e', `
+      const url = process.argv[1];
+      Promise.all([
+        fetch(url, { signal: AbortSignal.timeout(1200) }).then(r => r.text()),
+        fetch(url + '/api/state', { signal: AbortSignal.timeout(1200) }).then(r => r.json())
+      ])
+        .then(([html, data]) => {
+          const titleOk = /<title>Horizon Context Memory<\\/title>/.test(html);
+          process.exit(titleOk && data && data.status ? 0 : 3);
+        })
+        .catch(() => process.exit(4));
+    `, url], { stdio: 'ignore', timeout: 2000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -439,6 +458,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/health') return send(res, 200, runCommand(['health'], 30000));
   if (req.method === 'POST' && url.pathname === '/api/llm-review') return send(res, 200, runCommand(['llm-review'], 240000));
   return send(res, 404, { ok: false, error: 'not found' });
+});
+
+server.on('error', error => {
+  const url = `http://127.0.0.1:${PORT}`;
+  if (error.code === 'EADDRINUSE' && existingServerLooksHealthy(url)) {
+    console.log(`Horizon Context Memory web UI already running: ${url}`);
+    openBrowser(url);
+    return;
+  }
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use by another process.`);
+    console.error(`Stop it or run with another port, for example: HCM_WEB_PORT=38988 hcm`);
+    process.exit(1);
+  }
+  throw error;
 });
 
 server.listen(PORT, '127.0.0.1', () => {
