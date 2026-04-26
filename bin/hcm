@@ -1,0 +1,6 @@
+#!/bin/sh
+# Horizon Context Memory web memory manager.
+# hcm is intentionally web-first; advanced internals remain in hcm-core.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT="${HCM_HOME:-$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)}"
+exec node "$ROOT/web/server.js" "$@"

@@ -1,0 +1,33 @@
+{
+  "name": "horizon-context-memory",
+  "version": "0.1.0",
+  "description": "Local-first memory and self-evolution cockpit for Codex-style agent workflows.",
+  "bin": {
+    "hcm": "bin/hcm",
+    "hcm-core": "bin/hcm-core"
+  },
+  "scripts": {
+    "start": "bin/hcm --no-open",
+    "check": "node -c bin/hcm-core && node -c web/server.js"
+  },
+  "keywords": [
+    "codex",
+    "memory",
+    "agent",
+    "local-first",
+    "self-evolution",
+    "hcm"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/logcjj/horizon-context-memory.git"
+  },
+  "homepage": "https://github.com/logcjj/horizon-context-memory#readme",
+  "bugs": {
+    "url": "https://github.com/logcjj/horizon-context-memory/issues"
+  }
+}

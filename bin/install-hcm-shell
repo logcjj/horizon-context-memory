@@ -1,0 +1,11 @@
+#!/bin/sh
+ROOT="${HCM_HOME:-$HOME/.codex/hcm}"
+LINE='export PATH="${HCM_HOME:-$HOME/.codex/hcm}/bin:$PATH"'
+SHELL_RC="$HOME/.zshrc"
+if [ -f "$SHELL_RC" ] && grep -Fq '.codex/hcm/bin' "$SHELL_RC"; then
+  echo "PATH already configured in $SHELL_RC"
+else
+  printf '\n# Horizon Context Memory memory manager\n%s\n' "$LINE" >> "$SHELL_RC"
+  echo "Added hcm to PATH in $SHELL_RC. Restart terminal or run:"
+  echo "$LINE"
+fi

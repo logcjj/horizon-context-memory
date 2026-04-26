@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const raw = fs.readFileSync(0, 'utf8');
+const OMX = '/opt/homebrew/lib/node_modules/oh-my-codex/dist/scripts/codex-native-hook.js';
+const HCM_HOME = process.env.HCM_HOME || path.join(os.homedir(), '.codex', 'hcm');
+const HCM = path.join(HCM_HOME, 'bin', 'hcm-core');
+
+function run(cmd, args) {
+  const result = spawnSync(cmd, args, { input: raw, encoding: 'utf8', maxBuffer: 1024 * 1024 * 8 });
+  if (result.stderr) process.stderr.write(result.stderr);
+  const out = (result.stdout || '').trim();
+  if (!out) return null;
+  const last = out.split(/\r?\n/).filter(Boolean).at(-1);
+  try { return JSON.parse(last); } catch { return null; }
+}
+function ctx(obj) {
+  return obj && obj.hookSpecificOutput && typeof obj.hookSpecificOutput.additionalContext === 'string'
+    ? obj.hookSpecificOutput.additionalContext
+    : '';
+}
+function eventName(a, b) {
+  return a?.hookSpecificOutput?.hookEventName || b?.hookSpecificOutput?.hookEventName;
+}
+function merge(a, b) {
+  if (!a && !b) return null;
+  if (a?.decision === 'block') return a;
+  if (b?.decision === 'block') return b;
+  const ac = ctx(a);
+  const bc = ctx(b);
+  if (!ac && !bc) return a || b;
+  return {
+    ...(a || b || {}),
+    hookSpecificOutput: {
+      ...((a || b || {}).hookSpecificOutput || {}),
+      hookEventName: eventName(a, b),
+      additionalContext: [ac, bc].filter(Boolean).join('\n\n')
+    }
+  };
+}
+const omx = fs.existsSync(OMX) ? run(process.execPath, [OMX]) : null;
+const hcm = fs.existsSync(HCM) ? run(HCM, ['hook']) : null;
+const output = merge(omx, hcm);
+if (output) process.stdout.write(JSON.stringify(output) + '\n');

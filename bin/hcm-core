@@ -1,0 +1,1251 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const __emitWarning = process.emitWarning;
+process.emitWarning = function patchedHcmWarning(warning, ...args) {
+  const text = typeof warning === 'string' ? warning : String(warning && warning.message || warning || '');
+  if (text.includes('SQLite is an experimental feature')) return;
+  return __emitWarning.call(process, warning, ...args);
+};
+let SQLiteSync = null;
+try { SQLiteSync = require('node:sqlite').DatabaseSync; } catch {}
+
+const ROOT = process.env.HCM_HOME || path.join(os.homedir(), '.codex', 'hcm');
+const DATA = path.join(ROOT, 'data');
+const CONFIG_PATH = path.join(ROOT, 'config.json');
+const MEMORIES_PATH = path.join(DATA, 'memories.json');
+const USER_MD = path.join(DATA, 'USER.md');
+const MEMORY_MD = path.join(DATA, 'MEMORY.md');
+const SESSION_DB = path.join(DATA, 'sessions.sqlite');
+const LLM_REVIEW_SCHEMA = path.join(DATA, 'llm-review.schema.json');
+const AUTO_STATE = path.join(DATA, 'auto-state.json');
+const AUDIT = path.join(DATA, 'audit.jsonl');
+const PROPOSALS = path.join(ROOT, 'skills', 'proposals');
+const INSTALLED_SKILLS = path.join(os.homedir(), '.codex', 'skills');
+
+function ensureDir(dir) { fs.mkdirSync(dir, { recursive: true }); }
+function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } }
+function writeJson(file, value) { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n'); }
+function config() {
+  return {
+    enabled: true,
+    capturePrompts: true,
+    captureToolEvents: true,
+    injectSessionContext: true,
+    autoPromoteMemories: true,
+    memoryMinConfidence: 0.7,
+    maxStoredMemories: 5000,
+    maxEnabledMemories: 2000,
+    maxRetrievedMemories: 24,
+    maxPromptChars: 4000,
+    maxToolInputChars: 4000,
+    maxToolOutputChars: 4000,
+    autoLlmReview: true,
+    autoLlmReviewIntervalHours: 6,
+    autoLlmReviewEventThreshold: 8,
+    autoLlmReviewMemoryThreshold: 2,
+    sensitivePatterns: [],
+    ...readJson(CONFIG_PATH, {})
+  };
+}
+function nowIso() { return new Date().toISOString(); }
+function day() { return nowIso().slice(0, 10); }
+function sha(text) { return crypto.createHash('sha256').update(text).digest('hex'); }
+function clip(text, max) { const v = String(text ?? ''); return v.length > max ? v.slice(0, max) + `…[clipped ${v.length - max} chars]` : v; }
+function redact(text, cfg = config()) { let v = String(text ?? ''); for (const raw of cfg.sensitivePatterns || []) { try { v = v.replace(new RegExp(raw, 'g'), '[REDACTED]'); } catch {} } return v; }
+function stableProject(cwd) { return cwd ? cwd.replace(os.homedir(), '~') : 'unknown'; }
+function tokenize(text) { return [...new Set(String(text || '').toLowerCase().match(/[\p{L}\p{N}_-]{2,}/gu) || [])].slice(0, 80); }
+function appendJsonl(file, entry) { ensureDir(path.dirname(file)); fs.appendFileSync(file, JSON.stringify(entry) + '\n'); }
+function appendAudit(actor, action, detail) {
+  const ts = nowIso();
+  const memoryId = detail?.id || detail?.before?.id || detail?.after?.id || null;
+  const entry = { ...detail, id: sha(JSON.stringify([ts, actor, action, memoryId, detail?.before, detail?.after])).slice(0, 20), memory_id: memoryId, ts, actor, action };
+  appendJsonl(AUDIT, entry);
+  return entry;
+}
+function backupStore(label = 'auto') {
+  ensureDir(path.join(DATA, 'backups'));
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = path.join(DATA, 'backups', `memories-${label}-${stamp}.json`);
+  if (!fs.existsSync(MEMORIES_PATH)) writeJson(MEMORIES_PATH, { schema: 2, memories: [] });
+  fs.copyFileSync(MEMORIES_PATH, file);
+  return file;
+}
+function readJsonlFiles(dir, maxFiles = 45) {
+  ensureDir(dir);
+  return fs.readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort().slice(-maxFiles).flatMap(name => {
+    const file = path.join(dir, name);
+    return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+  });
+}
+function readStdinJson() { const raw = fs.readFileSync(0, 'utf8').trim(); if (!raw) return {}; try { return JSON.parse(raw); } catch { return {}; } }
+function payloadEvent(payload) { return String(payload.hook_event_name || payload.hookEventName || payload.event || payload.name || '').trim(); }
+function payloadPrompt(payload) { return String(payload.prompt || payload.user_prompt || payload.userPrompt || '').trim(); }
+function eventBase(payload) { return { ts: nowIso(), cwd: payload.cwd || process.cwd(), project: stableProject(payload.cwd || process.cwd()), session_id: payload.session_id || payload.sessionId || null, thread_id: payload.thread_id || payload.threadId || null, turn_id: payload.turn_id || payload.turnId || null, source: payload.source || null }; }
+function eventId(entry) { return sha(JSON.stringify([entry.ts, entry.kind, entry.session_id, entry.turn_id, entry.summary, entry.prompt, entry.tool])).slice(0, 24); }
+function recordEvent(kind, payload, body) {
+  const cfg = config(); if (!cfg.enabled) return null;
+  const entry = { schema: 4, kind, ...eventBase(payload), ...body };
+  entry.event_id = eventId(entry);
+  appendJsonl(path.join(DATA, 'events', `${day()}.jsonl`), entry);
+  indexEvent(entry);
+  return entry;
+}
+function loadStore() { const store = readJson(MEMORIES_PATH, { schema: 2, memories: [] }); return Array.isArray(store.memories) ? store : { schema: 2, memories: [] }; }
+function saveStore(store) { writeJson(MEMORIES_PATH, { schema: 2, memories: store.memories || [] }); syncMarkdown(store); }
+function isSensitive(text) { return /\[REDACTED\]|password|token|secret|api[_-]?key|sk-[a-z0-9_-]{12,}|ghp_[a-z0-9_]{12,}/i.test(String(text || '')); }
+function cleanMemoryText(text) {
+  return String(text || '')
+    .replace(/^\s*(记住|请记住|remember)[:：]?\s*/i, '')
+    .replace(/^\s*(以后|往后|之后)\s*/i, '以后')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[。.!！?？]+$/u, '。');
+}
+function memoryId(memory) { return sha(`${memory.domain}|${memory.scope}|${memory.project}|${memory.type}|${memory.text}`.toLowerCase()).slice(0, 16); }
+function hasExplicitMemorySignal(text) { return /(记住|请记住|以后|往后|之后|默认|每次|总是|偏好|我喜欢|我希望|规则|约定|流程|always|remember|prefer|preference|default|rule|workflow)/i.test(text); }
+function hasEphemeralSignal(text) { return /(这次|临时|暂时|今天|刚才|现在先|only this time|temporary|for now)/i.test(text); }
+function inferExpiry(text) {
+  const value = String(text || '');
+  const days = value.match(/(\d+)\s*(天|day|days)/i);
+  if (days) return new Date(Date.now() + Number(days[1]) * 86400000).toISOString();
+  if (/本周|this week/i.test(value)) return new Date(Date.now() + 7 * 86400000).toISOString();
+  if (/本月|this month/i.test(value)) return new Date(Date.now() + 30 * 86400000).toISOString();
+  return null;
+}
+function isExpired(memory) { return Boolean(memory.expiresAt && Date.parse(memory.expiresAt) < Date.now()); }
+function inferScopeAndType(prompt, project) {
+  if (/本机|这台电脑|电脑|mac|macbook|machine|local environment/i.test(prompt)) return { scope: 'machine', type: 'environment', project: 'machine' };
+  if (/工具|tool|cli|命令|command|hcm|codex|search|grep|ripgrep|rg|pnpm|npm|python|node/i.test(prompt)) return { scope: 'tool', type: 'tooling', project };
+  if (/失败|报错|不要|避免|危险|坑|教训|failed|error|avoid|danger/i.test(prompt)) return { scope: 'project', type: 'failure-lesson', project };
+  if (/流程|每次|步骤|workflow|修改后|提交前/i.test(prompt)) return { scope: 'workflow', type: 'workflow', project };
+  return { scope: 'project', type: 'project-rule', project };
+}
+function inferLifecycle(candidateOrText) {
+  const text = typeof candidateOrText === 'string' ? candidateOrText : String(candidateOrText.text || '');
+  const type = typeof candidateOrText === 'string' ? '' : String(candidateOrText.type || '');
+  const scope = typeof candidateOrText === 'string' ? '' : String(candidateOrText.scope || '');
+  if (/永久|一直|总是|always|forever|permanent/i.test(text)) return 'permanent';
+  if (/本周|本月|临时|暂时|today|this week|this month|temporary|for now/i.test(text)) return 'short';
+  if (scope === 'global' || type === 'preference') return 'long';
+  if (['workflow', 'tooling', 'command', 'failure-lesson'].includes(type) || ['workflow', 'tool'].includes(scope)) return 'project';
+  return 'project';
+}
+function lifecycleAudit(memory) {
+  const reasons = [];
+  const lastSeen = Date.parse(memory.lastSeen || memory.created || 0) || 0;
+  const ageDays = lastSeen ? Math.floor((Date.now() - lastSeen) / 86400000) : 0;
+  const usedCount = Number(memory.usedCount || 0);
+  const hits = Number(memory.hits || 0);
+  const tier = memory.lifecycle || inferLifecycle(memory);
+  if (isExpired(memory)) reasons.push('expired');
+  if (memory.status === 'disabled') reasons.push('disabled');
+  if (tier !== 'permanent' && ageDays > 90 && usedCount === 0) reasons.push('stale_unused_90d');
+  if (tier === 'short' && ageDays > 14) reasons.push('short_memory_old');
+  if (hits <= 1 && usedCount === 0 && tier !== 'permanent' && ageDays > 30) reasons.push('low_evidence_unused');
+  return { tier, ageDays, usedCount, hits, cleanup: reasons.length > 0, reasons };
+}
+function hasCorrectionSignal(text) {
+  return /(不是这样|不对|错了|记错|别这样|不要再|不要记|删除.*记忆|这个记忆错|纠正|改成|forget|wrong|incorrect|not true|do not remember)/i.test(String(text || ''));
+}
+
+function openSessionDb() {
+  if (!SQLiteSync) return null;
+  ensureDir(DATA);
+  const db = new SQLiteSync(SESSION_DB);
+  db.exec(`CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    ts TEXT,
+    kind TEXT,
+    project TEXT,
+    cwd TEXT,
+    session_id TEXT,
+    summary TEXT,
+    text TEXT
+  )`);
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(id UNINDEXED, project, summary, text)`);
+  return db;
+}
+function indexEvent(entry) {
+  const db = openSessionDb();
+  if (!db) return;
+  try {
+    const id = entry.event_id || sha(JSON.stringify([entry.ts, entry.kind, entry.session_id, entry.summary, entry.prompt, entry.tool])).slice(0, 24);
+    const text = `${entry.prompt || ''} ${entry.input || ''} ${entry.output || ''}`.trim();
+    db.prepare('INSERT OR IGNORE INTO events (id, ts, kind, project, cwd, session_id, summary, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, entry.ts || nowIso(), entry.kind || '', entry.project || '', entry.cwd || '', entry.session_id || '', entry.summary || '', text);
+    db.prepare('INSERT OR IGNORE INTO events_fts (id, project, summary, text) VALUES (?, ?, ?, ?)')
+      .run(id, entry.project || '', entry.summary || '', text);
+  } catch {}
+  try { db.close(); } catch {}
+}
+function rebuildIndex() {
+  if (!SQLiteSync) return { ok: false, reason: 'node:sqlite unavailable' };
+  try { fs.rmSync(SESSION_DB, { force: true }); } catch {}
+  const events = readJsonlFiles(path.join(DATA, 'events'), 365);
+  for (const event of events) indexEvent(event);
+  return { ok: true, indexed: events.length, db: SESSION_DB };
+}
+function searchSessions(query, limit = 10) {
+  const fallback = () => searchEventsFallback(query, limit);
+  const db = openSessionDb();
+  if (!db) return fallback();
+  const q = String(query || '').trim();
+  if (!q) return [];
+  try {
+    const escaped = q.split(/\s+/).filter(Boolean).map(x => `"${x.replace(/"/g, '""')}"`).join(' OR ');
+    const rows = db.prepare(`SELECT e.ts, e.kind, e.project, e.summary, snippet(events_fts, 3, '[', ']', '…', 12) AS snippet
+      FROM events_fts JOIN events e ON e.id = events_fts.id
+      WHERE events_fts MATCH ?
+      ORDER BY rank
+      LIMIT ?`).all(escaped, limit);
+    try { db.close(); } catch {}
+    return rows.length ? rows : fallback();
+  } catch {
+    try { db.close(); } catch {}
+    return fallback();
+  }
+}
+function searchEventsFallback(query, limit = 10) {
+  const tokens = tokenize(query);
+  if (!tokens.length) return [];
+  return readJsonlFiles(path.join(DATA, 'events'), 365).map(e => {
+    const text = `${e.project || ''} ${e.summary || ''} ${e.prompt || ''} ${e.input || ''} ${e.output || ''}`.toLowerCase();
+    const score = tokens.reduce((sum, token) => sum + (text.includes(token) ? 1 : 0), 0);
+    return { e, score };
+  }).filter(x => x.score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map(({ e }) => ({
+    ts: e.ts, kind: e.kind, project: e.project, summary: e.summary || e.prompt || e.kind, snippet: e.summary || e.prompt || ''
+  }));
+}
+function normalizeForCompare(text) {
+  return String(text || '').toLowerCase().replace(/[\s。.!！?？`"'“”‘’：:，,、-]+/g, '');
+}
+function normalizeSemanticText(text) {
+  return cleanMemoryText(text)
+    .toLowerCase()
+    .replace(/horizon context memory|hcm/g, 'hcm')
+    .replace(/用户偏好|项目规则|项目记忆|工作流|流程经验/g, '')
+    .replace(/请记住|记住|以后|往后|之后|默认|需要|应该|必须|可以|这个项目|当前项目|这个仓库|本仓库|此项目|本项目|每次|先|再|然后|结果|完成/g, '')
+    .replace(/[\s。.!！?？`"'“”‘’：:，,、\-_/]+/g, '');
+}
+function charShingles(text, size = 2) {
+  const value = normalizeSemanticText(text);
+  if (!value) return [];
+  if (value.length <= size) return [value];
+  const out = [];
+  for (let index = 0; index <= value.length - size; index += 1) out.push(value.slice(index, index + size));
+  return [...new Set(out)];
+}
+function jaccard(left, right) {
+  const a = new Set(left);
+  const b = new Set(right);
+  if (!a.size || !b.size) return 0;
+  let same = 0;
+  for (const item of a) if (b.has(item)) same += 1;
+  return same / (a.size + b.size - same);
+}
+function containment(left, right) {
+  const a = new Set(left);
+  const b = new Set(right);
+  if (!a.size || !b.size) return 0;
+  let same = 0;
+  for (const item of a) if (b.has(item)) same += 1;
+  return same / Math.min(a.size, b.size);
+}
+function semanticSimilarity(left, right) {
+  const leftText = normalizeSemanticText(left.text);
+  const rightText = normalizeSemanticText(right.text);
+  if (!leftText || !rightText) return { score: 0, containment: 0, tokenScore: 0, shingleScore: 0 };
+  if (leftText === rightText) return { score: 1, containment: 1, tokenScore: 1, shingleScore: 1 };
+  if (leftText.includes(rightText) || rightText.includes(leftText)) {
+    const ratio = Math.min(leftText.length, rightText.length) / Math.max(leftText.length, rightText.length);
+    return { score: Math.max(0.88, ratio), containment: 1, tokenScore: ratio, shingleScore: ratio };
+  }
+  const leftTokens = tokenize(left.text);
+  const rightTokens = tokenize(right.text);
+  const leftShingles = charShingles(left.text);
+  const rightShingles = charShingles(right.text);
+  const tokenScore = jaccard(leftTokens, rightTokens);
+  const shingleScore = jaccard(leftShingles, rightShingles);
+  const cover = Math.max(containment(leftTokens, rightTokens), containment(leftShingles, rightShingles));
+  return { score: Math.max(tokenScore, shingleScore * 0.92, cover * 0.9), containment: cover, tokenScore, shingleScore };
+}
+function compatibleMemoryKind(left, right) {
+  if (left.domain !== right.domain || left.project !== right.project) return false;
+  if (left.scope !== right.scope) return false;
+  if (left.type === right.type) return true;
+  const compatible = [
+    new Set(['tooling', 'command']),
+    new Set(['workflow', 'project-rule']),
+    new Set(['preference', 'style'])
+  ];
+  return compatible.some(group => group.has(left.type) && group.has(right.type));
+}
+function hasSemanticConflict(left, right) {
+  const text = `${left.text}\n${right.text}`;
+  const packageManagers = [...new Set((text.match(/\b(pnpm|npm|yarn|bun)\b/gi) || []).map(v => v.toLowerCase()))];
+  if (/(默认用|default)/i.test(text) && packageManagers.length > 1) return true;
+  const negative = /(不要|避免|禁止|不用|不需要|do not|avoid|never)/i;
+  const positive = /(需要|使用|默认|必须|always|use|prefer)/i;
+  return ((negative.test(left.text) && positive.test(right.text)) || (positive.test(left.text) && negative.test(right.text))) && semanticSimilarity(left, right).score >= 0.55;
+}
+function memoryRank(memory) {
+  const textLength = String(memory.text || '').length;
+  return Number(memory.usedCount || 0) * 5 + Number(memory.hits || 0) * 3 + Number(memory.confidence || 0) * 10 + Math.min(6, textLength / 80);
+}
+function mergeMemoryInto(target, source) {
+  target.hits = Number(target.hits || 0) + Number(source.hits || 0);
+  target.usedCount = Number(target.usedCount || 0) + Number(source.usedCount || 0);
+  target.confidence = Math.max(Number(target.confidence || 0), Number(source.confidence || 0));
+  target.created = [target.created, source.created].filter(Boolean).sort()[0] || target.created || source.created || nowIso();
+  target.lastSeen = [target.lastSeen, source.lastSeen].filter(Boolean).sort().at(-1) || nowIso();
+  target.lastUsedAt = [target.lastUsedAt, source.lastUsedAt].filter(Boolean).sort().at(-1) || target.lastUsedAt || source.lastUsedAt;
+  target.evidence_event_ids = [...new Set([...(target.evidence_event_ids || []), ...(source.evidence_event_ids || [])])];
+  target.correction_event_ids = [...new Set([...(target.correction_event_ids || []), ...(source.correction_event_ids || [])])];
+  if (target.status === 'disabled' && source.status !== 'disabled') target.status = source.status;
+  if (!target.review && source.review && source.status !== 'disabled') target.review = source.review;
+  if (!target.review_reason && source.review_reason) target.review_reason = source.review_reason;
+  target.semantic_merged_ids = [...new Set([...(target.semantic_merged_ids || []), source.id, ...(source.semantic_merged_ids || [])].filter(Boolean))];
+  return target;
+}
+
+function ensureLlmReviewSchema() {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      actions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            action: { type: 'string', enum: ['keep', 'replace', 'disable', 'delete'] },
+            id: { type: 'string' },
+            text: { type: 'string' },
+            reason: { type: 'string' }
+          },
+          required: ['action', 'id', 'text', 'reason']
+        }
+      },
+      new_memories: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            domain: { type: 'string', enum: ['user', 'memory'] },
+            type: { type: 'string' },
+            scope: { type: 'string', enum: ['global', 'project', 'machine', 'workflow', 'tool'] },
+            project: { type: 'string' },
+            text: { type: 'string' },
+            confidence: { type: 'number' },
+            reason: { type: 'string' },
+            expiresAt: { type: ['string', 'null'] },
+            review_reason: { type: ['string', 'null'] },
+            evidence_event_ids: { type: 'array', items: { type: 'string' } }
+          },
+          required: ['domain', 'type', 'scope', 'project', 'text', 'confidence', 'reason']
+        }
+      }
+    },
+    required: ['actions', 'new_memories']
+  };
+  writeJson(LLM_REVIEW_SCHEMA, schema);
+}
+function parseCodexJsonOutput(file) {
+  const raw = fs.readFileSync(file, 'utf8').trim();
+  if (!raw) return null;
+  const directStart = raw.indexOf('{');
+  const directEnd = raw.lastIndexOf('}');
+  if (directStart >= 0 && directEnd > directStart) {
+    try { return JSON.parse(raw.slice(directStart, directEnd + 1)); } catch {}
+  }
+  return null;
+}
+function llmReviewMemories(options = {}) {
+  ensureLlmReviewSchema();
+  if (options.dryRun) return { ok: true, dryRun: true, schema: LLM_REVIEW_SCHEMA };
+  const store = loadStore();
+  const events = readJsonlFiles(path.join(DATA, 'events'), 14).slice(-80);
+  const reviewInput = {
+    instructions: [
+      'Review Horizon Context Memory memories like local memory hygiene.',
+      'Keep durable user preferences in USER memories and project/workflow facts in MEMORY memories.',
+      'Do not preserve temporary one-off instructions as long-term memories.',
+      'Prefer concise, atomic, reusable memories.',
+      'If a memory is incorrect, stale, duplicate, too broad, or conflicts with another memory, propose replace/disable/delete.',
+      'Never include secrets, tokens, passwords, API keys, or private raw outputs.'
+    ],
+    current_project: stableProject(process.cwd()),
+    memories: store.memories,
+    recent_events: events.map(e => ({ ts: e.ts, kind: e.kind, project: e.project, summary: e.summary, prompt: e.prompt })).slice(-60)
+  };
+  const tmpIn = path.join(DATA, 'llm-review-input.json');
+  const tmpOut = path.join(DATA, 'llm-review-output.json');
+  writeJson(tmpIn, reviewInput);
+  const prompt = `You are a memory curator. Return only JSON matching the provided schema. Review this file: ${tmpIn}`;
+  try {
+    execFileSync('codex', ['exec', '--skip-git-repo-check', '--output-schema', LLM_REVIEW_SCHEMA, '-o', tmpOut, prompt], {
+      cwd: process.cwd(),
+      stdio: options.verbose ? 'inherit' : ['ignore', 'pipe', 'pipe'],
+      timeout: options.timeoutMs || 180000,
+      env: { ...process.env, HCM_LLM_REVIEW: '1' }
+    });
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error), input: tmpIn, output: tmpOut };
+  }
+  const result = parseCodexJsonOutput(tmpOut);
+  if (!result) return { ok: false, error: 'failed to parse Codex JSON output', input: tmpIn, output: tmpOut };
+  return applyLlmReview(result);
+}
+function applyLlmReview(review) {
+  const store = loadStore();
+  const applied = [];
+  const backup = backupStore('llm-review');
+  for (const action of review.actions || []) {
+    const memory = store.memories.find(m => m.id === action.id);
+    if (!memory) continue;
+    const before = JSON.parse(JSON.stringify(memory));
+    if (action.action === 'replace' && action.text) {
+      if (isSensitive(action.text)) {
+        memory.status = 'disabled';
+        memory.review = 'llm-sensitive-replacement-blocked';
+        memory.review_reason = action.reason || 'LLM replacement looked sensitive and was blocked';
+        applied.push({ id: memory.id, action: 'blocked-sensitive-replace' });
+      } else {
+        memory.text = cleanMemoryText(redact(action.text));
+        memory.review_reason = action.reason;
+        memory.review = undefined;
+        memory.lastSeen = nowIso();
+        applied.push({ id: memory.id, action: 'replace' });
+      }
+      memory.updated = nowIso();
+      appendAudit('llm-review', 'update', { id: memory.id, before, after: memory, reason: action.reason });
+    } else if (action.action === 'disable') {
+      memory.status = 'disabled';
+      memory.review = memory.review || 'llm-disabled';
+      memory.review_reason = action.reason;
+      memory.updated = nowIso();
+      applied.push({ id: memory.id, action: 'disable' });
+      appendAudit('llm-review', 'disable', { id: memory.id, before, after: memory, reason: action.reason });
+    } else if (action.action === 'delete') {
+      memory.status = 'disabled';
+      memory.review = 'llm-delete-candidate';
+      memory.review_reason = action.reason || 'LLM suggested deletion; disabled for review instead of hard delete';
+      memory.updated = nowIso();
+      applied.push({ id: memory.id, action: 'disable-delete-candidate' });
+      appendAudit('llm-review', 'disable-delete-candidate', { id: memory.id, before, after: memory, reason: action.reason });
+    } else if (action.action === 'keep') {
+      memory.review = undefined;
+      memory.review_reason = action.reason;
+      memory.updated = nowIso();
+      applied.push({ id: memory.id, action: 'keep' });
+      appendAudit('llm-review', 'keep', { id: memory.id, before, after: memory, reason: action.reason });
+    }
+  }
+  for (const item of review.new_memories || []) {
+    if (!item.text || isSensitive(item.text)) continue;
+    const candidate = {
+      domain: item.domain,
+      type: item.type || (item.domain === 'user' ? 'preference' : 'fact'),
+      scope: item.scope,
+      project: item.scope === 'project' ? (item.project || stableProject(process.cwd())) : 'global',
+      text: cleanMemoryText(item.text),
+      confidence: Math.max(0, Math.min(1, Number(item.confidence) || 0.75)),
+      evidence: `llm-review: ${item.reason || ''}`,
+      evidence_event_ids: Array.isArray(item.evidence_event_ids) ? item.evidence_event_ids : [],
+      expiresAt: item.expiresAt || null,
+      review_reason: item.review_reason || item.reason || null
+    };
+    const id = memoryId(candidate);
+    if (!store.memories.some(m => m.id === id)) {
+      const memory = { id, status: 'enabled', created: nowIso(), lastSeen: nowIso(), hits: 1, source: 'llm-review', cwd: process.cwd(), ...candidate };
+      store.memories.push(memory);
+      appendAudit('llm-review', 'create', { id, after: memory, reason: item.reason });
+      applied.push({ id, action: 'new' });
+    }
+  }
+  trimStore(store);
+  saveStore(store);
+  return { ok: true, applied, memories: store.memories.length, backup };
+}
+
+function consolidateMemories() {
+  const store = loadStore();
+  const byKey = new Map();
+  const removed = [];
+  const semanticMerged = [];
+  for (const memory of store.memories) {
+    const key = `${memory.domain}|${memory.scope}|${memory.project}|${memory.type}|${normalizeForCompare(memory.text)}`;
+    const existing = byKey.get(key);
+    if (!existing) { byKey.set(key, memory); continue; }
+    const before = JSON.parse(JSON.stringify(existing));
+    const duplicate = JSON.parse(JSON.stringify(memory));
+    mergeMemoryInto(existing, memory);
+    removed.push(memory.id);
+    appendAudit('auto-maintenance', 'duplicate-merge', { id: existing.id, before, after: existing, merged: duplicate });
+  }
+  let memories = [...byKey.values()];
+  const semanticBuckets = new Map();
+  for (const memory of memories) {
+    const key = `${memory.domain}|${memory.scope}|${memory.project}`;
+    if (!semanticBuckets.has(key)) semanticBuckets.set(key, []);
+    semanticBuckets.get(key).push(memory);
+  }
+  const semanticRemoved = new Set();
+  for (const bucket of semanticBuckets.values()) {
+    for (let leftIndex = 0; leftIndex < bucket.length; leftIndex += 1) {
+      const left = bucket[leftIndex];
+      if (semanticRemoved.has(left.id)) continue;
+      for (let rightIndex = leftIndex + 1; rightIndex < bucket.length; rightIndex += 1) {
+        const right = bucket[rightIndex];
+        if (semanticRemoved.has(right.id) || !compatibleMemoryKind(left, right)) continue;
+        const similarity = semanticSimilarity(left, right);
+        if ((similarity.score >= 0.9 || similarity.containment >= 0.96) && !hasSemanticConflict(left, right)) {
+          const keeper = memoryRank(left) >= memoryRank(right) ? left : right;
+          const merged = keeper === left ? right : left;
+          const before = JSON.parse(JSON.stringify(keeper));
+          const removedBefore = JSON.parse(JSON.stringify(merged));
+          mergeMemoryInto(keeper, merged);
+          semanticRemoved.add(merged.id);
+          semanticMerged.push({ kept: keeper.id, removed: merged.id, score: Number(similarity.score.toFixed(3)), containment: Number(similarity.containment.toFixed(3)) });
+          appendAudit('auto-maintenance', 'semantic-merge', { id: keeper.id, before, after: keeper, merged: removedBefore, score: Number(similarity.score.toFixed(3)), containment: Number(similarity.containment.toFixed(3)) });
+        } else if (similarity.score >= 0.72 || hasSemanticConflict(left, right)) {
+          const leftBefore = JSON.parse(JSON.stringify(left));
+          const rightBefore = JSON.parse(JSON.stringify(right));
+          left.review = left.review || 'semantic-conflict-or-overlap';
+          right.review = right.review || 'semantic-conflict-or-overlap';
+          const reason = hasSemanticConflict(left, right) ? 'semantic conflict detected' : `semantic overlap score ${similarity.score.toFixed(2)}`;
+          left.review_reason = left.review_reason || reason;
+          right.review_reason = right.review_reason || reason;
+          appendAudit('auto-maintenance', 'semantic-review', { id: left.id, before: leftBefore, after: left, related_before: rightBefore, related_after: right, reason });
+        }
+      }
+    }
+  }
+  memories = memories.filter(memory => !semanticRemoved.has(memory.id));
+  const enabled = memories.filter(m => m.status !== 'disabled');
+  for (const memory of enabled) {
+    const related = enabled.filter(other => other.id !== memory.id && other.domain === memory.domain && other.project === memory.project && other.type === memory.type);
+    const tokens = new Set(tokenize(memory.text));
+    for (const other of related) {
+      const overlap = tokenize(other.text).filter(t => tokens.has(t)).length;
+      if (overlap >= Math.min(4, Math.max(2, tokens.size - 1)) && Math.abs(String(other.text).length - String(memory.text).length) < 40) {
+        memory.review = 'possible-duplicate-or-conflict';
+        other.review = 'possible-duplicate-or-conflict';
+      }
+    }
+  }
+  const byProject = new Map();
+  for (const memory of memories.filter(m => m.status !== 'disabled' && m.domain === 'memory')) {
+    const key = `${memory.project}|${memory.scope}`;
+    if (!byProject.has(key)) byProject.set(key, []);
+    byProject.get(key).push(memory);
+  }
+  for (const group of byProject.values()) {
+    const packageManagers = group.filter(m => /(默认用|default)/i.test(m.text) && /\b(pnpm|npm|yarn|bun)\b/i.test(m.text));
+    const values = new Set(packageManagers.map(m => (m.text.match(/\b(pnpm|npm|yarn|bun)\b/i) || [])[1]?.toLowerCase()).filter(Boolean));
+    if (values.size > 1) for (const memory of packageManagers) { memory.review = 'package-manager-conflict'; memory.review_reason = `conflicting package managers: ${[...values].join(', ')}`; }
+  }
+  for (const memory of memories) {
+    memory.lifecycle = memory.lifecycle || inferLifecycle(memory);
+    memory.lifecycle_audit = lifecycleAudit(memory);
+    if (isExpired(memory)) { memory.review = 'expired'; memory.status = 'disabled'; }
+    else if (memory.lifecycle_audit.cleanup && memory.status !== 'disabled' && !memory.review) {
+      memory.review = 'cleanup-suggested';
+      memory.review_reason = `Lifecycle cleanup suggested: ${memory.lifecycle_audit.reasons.join(', ')}`;
+    }
+  }
+  store.memories = memories.sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
+  saveStore(store);
+  return { memories: store.memories.length, removedDuplicates: removed.length, removedSemantic: semanticMerged.length, reviewNeeded: store.memories.filter(m => m.review).length, removed, semanticMerged };
+}
+
+function classifyMemory(payload, rawPrompt) {
+  const cwd = payload.cwd || process.cwd();
+  const project = stableProject(cwd);
+  const prompt = String(rawPrompt || '').replace(/\s+/g, ' ').trim();
+  if (!prompt || isSensitive(prompt) || !hasExplicitMemorySignal(prompt)) return [];
+  if (hasEphemeralSignal(prompt) && !/(记住|以后|总是|每次|always|remember)/i.test(prompt)) return [];
+  const candidates = [];
+  const userPreference = /(我偏好|我的偏好|我喜欢|我希望|以后回答|回答我|沟通|语气|格式|先给|不要啰嗦|prefer|preference|style|tone)/i.test(prompt);
+  const projectRule = /(这个项目|当前项目|这个仓库|本仓库|此项目|this project|this repo|repo|仓库|项目)/i.test(prompt);
+  const workflow = /(每次|流程|步骤|修改后|提交前|运行|执行|测试|编译|构建|检查|workflow|before|after|run|test|build|compile)/i.test(prompt);
+  const commandMatch = prompt.match(/[`“"]([^`”"]{2,180})[`”"]/);
+  const cleaned = cleanMemoryText(prompt);
+  if (userPreference && !projectRule) {
+    candidates.push({ domain: 'user', type: 'preference', scope: 'global', project: 'global', text: cleaned, confidence: 0.88, evidence: 'explicit user preference signal' });
+  } else if (projectRule || workflow || commandMatch || /失败|报错|不要|避免|危险|坑|教训|本机|工具|命令|hcm|codex/i.test(prompt)) {
+    const inferred = inferScopeAndType(prompt, project);
+    candidates.push({ domain: 'memory', type: inferred.type, scope: inferred.scope, project: inferred.project, text: cleaned, confidence: projectRule ? 0.86 : 0.76, evidence: 'explicit project/workflow/tooling signal', expiresAt: inferExpiry(prompt) });
+  } else {
+    candidates.push({ domain: 'user', type: 'preference', scope: 'global', project: 'global', text: cleaned, confidence: 0.72, evidence: 'explicit durable memory signal' });
+  }
+  if (commandMatch && (projectRule || workflow)) {
+    candidates.push({ domain: 'memory', type: 'command', scope: 'tool', project, text: `常用命令：${commandMatch[1]}`, confidence: 0.8, evidence: 'quoted command in durable workflow signal', expiresAt: inferExpiry(prompt) });
+  }
+  return candidates.filter(c => c.text.length >= 4 && c.text.length <= 500).map(c => ({ ...c, lifecycle: c.lifecycle || inferLifecycle(c) }));
+}
+function upsertMemory(candidate, payload) {
+  const cfg = config();
+  if (!cfg.autoPromoteMemories || candidate.confidence < (cfg.memoryMinConfidence || 0.7)) return null;
+  const store = loadStore();
+  const id = memoryId(candidate);
+  const existing = store.memories.find(m => m.id === id);
+  if (existing) {
+    existing.lastSeen = nowIso(); existing.hits = (existing.hits || 1) + 1; existing.confidence = Math.max(existing.confidence || 0, candidate.confidence || 0); if (candidate.evidence_event_ids) existing.evidence_event_ids = [...new Set([...(existing.evidence_event_ids || []), ...candidate.evidence_event_ids])];
+  } else {
+    store.memories.push({ id, status: 'enabled', created: nowIso(), lastSeen: nowIso(), hits: 1, usedCount: 0, source: 'auto', cwd: payload.cwd || process.cwd(), ...candidate });
+  }
+  trimStore(store);
+  saveStore(store);
+  recordEvent('memory-promoted', payload, { summary: `Memory enabled: ${candidate.text}`, memory_id: id, memory_domain: candidate.domain, memory_type: candidate.type });
+  return id;
+}
+function insertCandidateMemory(candidate, payload) {
+  const store = loadStore();
+  const normalized = { ...candidate, lifecycle: candidate.lifecycle || inferLifecycle(candidate), evidence_event_ids: candidate.evidence_event_ids || [] };
+  const id = memoryId(normalized);
+  const existing = store.memories.find(m => m.id === id);
+  if (existing) {
+    existing.lastSeen = nowIso();
+    existing.hits = (existing.hits || 1) + 1;
+    existing.review = existing.review || 'auto-candidate';
+    existing.review_reason = existing.review_reason || normalized.review_reason;
+    existing.evidence_event_ids = [...new Set([...(existing.evidence_event_ids || []), ...normalized.evidence_event_ids])];
+  } else {
+    store.memories.push({ id, status: 'disabled', created: nowIso(), lastSeen: nowIso(), hits: 1, usedCount: 0, source: 'pattern-miner', cwd: payload.cwd || process.cwd(), review: 'auto-candidate', ...normalized });
+  }
+  trimStore(store);
+  saveStore(store);
+  recordEvent('memory-candidate', payload, { summary: `Memory candidate: ${normalized.text}`, memory_id: id, memory_domain: normalized.domain, memory_type: normalized.type });
+  return id;
+}
+function relatedMemoriesForText(text, store = loadStore()) {
+  const needle = String(text || '');
+  const idMatches = store.memories.filter(m => needle.includes(m.id));
+  if (idMatches.length) return idMatches;
+  const tokens = tokenize(needle).filter(t => !['记忆', 'memory', 'wrong', 'incorrect', '不是', '这样', '不对', '删除', '不要'].includes(t));
+  return store.memories.map(m => {
+    const haystack = `${m.text || ''} ${m.project || ''} ${m.type || ''}`;
+    return { memory: m, score: scoreText(haystack, tokens) };
+  }).filter(x => x.score >= Math.min(3, Math.max(1, tokens.length))).sort((a, b) => b.score - a.score).slice(0, 5).map(x => x.memory);
+}
+function applyCorrectionSignal(payload, prompt, promptEvent) {
+  if (!hasCorrectionSignal(prompt)) return [];
+  const store = loadStore();
+  const related = relatedMemoriesForText(prompt, store);
+  const destructive = /(不要记|删除.*记忆|forget|do not remember|remove memory)/i.test(prompt);
+  const applied = [];
+  for (const memory of related) {
+    memory.review = destructive ? 'user-requested-removal' : 'user-correction';
+    memory.review_reason = `User correction prompt: ${clip(prompt, 240)}`;
+    memory.correctedAt = nowIso();
+    memory.correction_event_ids = [...new Set([...(memory.correction_event_ids || []), promptEvent?.event_id].filter(Boolean))];
+    if (destructive) memory.status = 'disabled';
+    applied.push(memory.id);
+  }
+  if (applied.length) {
+    saveStore(store);
+    recordEvent('memory-correction', payload, { summary: `Correction marked memories: ${applied.join(', ')}`, memory_ids: applied, prompt });
+  }
+  return applied;
+}
+function parseToolInputCommand(input) {
+  try {
+    const parsed = typeof input === 'string' ? JSON.parse(input) : input;
+    return String(parsed.cmd || parsed.command || parsed.shell_command || parsed.args?.join?.(' ') || '').trim();
+  } catch { return ''; }
+}
+function mineRecurringPatterns(payload) {
+  const cfg = config();
+  if (cfg.autoMineMemoryCandidates === false) return { ok: true, skipped: 'disabled' };
+  const project = stableProject(payload.cwd || process.cwd());
+  const events = readJsonlFiles(path.join(DATA, 'events'), 30).filter(e => e.project === project);
+  const commands = new Map();
+  for (const event of events) {
+    if (event.kind !== 'pre-tool' && event.kind !== 'post-tool') continue;
+    const command = parseToolInputCommand(event.input);
+    if (!command || command.length > 180 || isSensitive(command)) continue;
+    if (!commands.has(command)) commands.set(command, []);
+    commands.get(command).push(event.event_id);
+  }
+  const created = [];
+  for (const [command, eventIds] of commands) {
+    if (eventIds.length < Math.max(3, Number(cfg.memoryCandidateThreshold || 3))) continue;
+    const id = insertCandidateMemory({
+      domain: 'memory',
+      type: 'observed-command',
+      scope: 'tool',
+      project,
+      text: `观察到本项目重复使用命令：${command}`,
+      confidence: 0.62,
+      evidence: `pattern-miner: command repeated ${eventIds.length} times`,
+      evidence_event_ids: eventIds.slice(-8),
+      review_reason: '自动模式挖掘生成，需在网页端确认后启用。'
+    }, payload);
+    created.push(id);
+  }
+  return { ok: true, candidates: created.length, ids: created };
+}
+function trimStore(store) {
+  const cfg = config();
+  const maxStored = Number(cfg.maxStoredMemories || 5000);
+  const rank = memory => {
+    let score = 0;
+    if (memory.status !== 'disabled') score += 1000;
+    if (memory.review) score += 120;
+    if (memory.lifecycle === 'permanent') score += 80;
+    score += Math.min(200, Number(memory.usedCount || 0) * 12);
+    score += Math.min(120, Number(memory.hits || 0) * 8);
+    score += Math.min(50, Number(memory.confidence || 0) * 50);
+    const last = Date.parse(memory.lastUsedAt || memory.lastSeen || memory.updated || memory.created || 0) || 0;
+    score += Math.max(0, 60 - Math.floor((Date.now() - last) / 86400000));
+    return score;
+  };
+  store.memories = store.memories.sort((a, b) => rank(b) - rank(a) || String(b.lastSeen).localeCompare(String(a.lastSeen))).slice(0, maxStored);
+}
+function byDomain(store, domain) { return store.memories.filter(m => m.domain === domain && m.status !== 'disabled'); }
+function syncMarkdown(store = loadStore()) {
+  ensureDir(DATA);
+  const user = byDomain(store, 'user');
+  const memory = byDomain(store, 'memory');
+  fs.writeFileSync(USER_MD, ['# USER.md', '', 'Horizon Context Memory 自动维护的用户偏好记忆。', '', ...user.map(m => `- [${m.id}] (${m.type}, ${m.confidence}) ${m.text}`), ''].join('\n'));
+  fs.writeFileSync(MEMORY_MD, ['# MEMORY.md', '', 'Horizon Context Memory 自动维护的项目、环境、流程记忆。', '', ...memory.map(m => `- [${m.id}] (${m.project}, ${m.type}, ${m.confidence}) ${m.text}`), ''].join('\n'));
+}
+function scoreText(text, tokens) { const lower = String(text || '').toLowerCase(); return tokens.reduce((s, t) => s + (lower.includes(t) ? 1 : 0), 0); }
+function retrieveMemories(cwd, query, limit) {
+  const tokens = tokenize(query); const project = stableProject(cwd);
+  const scored = loadStore().memories.filter(m => m.status !== 'disabled' && !isExpired(m)).map(m => {
+    let s = m.domain === 'user' ? 3 : 0;
+    if (m.project === project) s += 7;
+    if (m.scope === 'global') s += 2;
+    s += scoreText(`${m.type} ${m.text} ${m.evidence || ''}`, tokens);
+    s += Math.min(5, m.hits || 1);
+    s += Math.min(5, m.usedCount || 0);
+    if (m.lifecycle === 'permanent') s += 2;
+    if (m.review) s -= 5;
+    return { m, s };
+  }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
+  const selected = [];
+  const add = item => { if (item && !selected.some(m => m.id === item.m.id) && selected.length < limit) selected.push(item.m); };
+  scored.filter(x => x.m.domain === 'user').slice(0, Math.min(8, Math.ceil(limit / 3))).forEach(add);
+  scored.filter(x => x.m.domain === 'memory' && x.m.project === project).slice(0, Math.min(12, Math.ceil(limit / 2))).forEach(add);
+  scored.forEach(add);
+  return selected;
+}
+
+function markMemoriesUsed(memories) {
+  if (!memories || memories.length === 0) return;
+  const store = loadStore();
+  let changed = false;
+  for (const used of memories) {
+    const memory = store.memories.find(m => m.id === used.id);
+    if (!memory) continue;
+    memory.usedCount = (memory.usedCount || 0) + 1;
+    memory.lastUsedAt = nowIso();
+    changed = true;
+    maybeCreateSkillProposal(memory);
+  }
+  if (changed) saveStore(store);
+}
+function maybeCreateSkillProposal(memory) {
+  const cfg = config();
+  if (cfg.autoCreateSkillProposals === false) return;
+  if (!['workflow', 'command', 'tooling', 'failure-lesson'].includes(memory.type)) return;
+  const count = Math.max(memory.usedCount || 0, memory.hits || 0);
+  const threshold = Math.max(2, Number(cfg.skillProposalThreshold || 3));
+  if (count < threshold || memory.skillProposalId) return;
+  ensureDir(PROPOSALS);
+  const slug = memory.text.toLowerCase().replace(/[^a-z0-9一-龥]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || memory.id;
+  const file = path.join(PROPOSALS, `${new Date().toISOString().replace(/[:.]/g, '-')}-${slug}.md`);
+  const skillName = `memory-${memory.id}`;
+  const body = `---
+title: ${JSON.stringify(memory.text)}
+status: proposal
+source_memory: ${memory.id}
+created: ${nowIso()}
+---
+
+# ${memory.text}
+
+## Proposed SKILL.md
+
+\`\`\`markdown
+---
+name: ${skillName}
+description: Use when the task matches this learned workflow or lesson.
+---
+
+# ${memory.text}
+
+## Workflow
+1. Recall this memory: ${memory.text}
+2. Verify current project evidence before acting.
+3. Apply the workflow conservatively.
+4. Record any correction back into Horizon Context Memory memory.
+\`\`\`
+`;
+  fs.writeFileSync(file, body);
+  memory.skillProposalId = file;
+}
+function retrieveEvents(cwd, query, limit) {
+  const tokens = tokenize(query);
+  return readJsonlFiles(path.join(DATA, 'events')).filter(e => ['prompt', 'session-start', 'memory-promoted'].includes(e.kind)).map(e => {
+    let s = 0; if (e.cwd === cwd) s += 4; if (e.project === stableProject(cwd)) s += 2; s += scoreText(`${e.summary || ''} ${e.prompt || ''}`, tokens); return { e, s };
+  }).filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, limit).map(x => x.e);
+}
+function context(cwd, query = '') {
+  const cfg = config(); const memories = retrieveMemories(cwd, query, cfg.maxRetrievedMemories || 24); markMemoriesUsed(memories); const events = retrieveEvents(cwd, query, Math.max(0, Math.min(8, 12 - Math.ceil(memories.length / 3))));
+  const lines = ['[Horizon Context Memory automatic memory]', '- Long-term memory is automatic. USER memories store preferences; MEMORY stores project rules and workflows.', '- Treat memories as advisory and verify repository facts against current files.'];
+  const users = memories.filter(m => m.domain === 'user'); const mems = memories.filter(m => m.domain === 'memory');
+  if (users.length) { lines.push('[USER.md memories]'); for (const m of users) lines.push(`- ${m.id} ${m.type}: ${clip(m.text, 220)}`); }
+  if (mems.length) { lines.push('[MEMORY.md memories]'); for (const m of mems) lines.push(`- ${m.id} ${m.project}/${m.type}: ${clip(m.text, 220)}`); }
+  if (events.length) { lines.push('[Recent memory evidence]'); for (const e of events) lines.push(`- ${e.ts} ${e.project}: ${clip(e.summary || e.prompt || e.kind, 160)}`); }
+  const sessionRows = searchSessions(query, 4);
+  if (sessionRows.length) { lines.push('[Session search]'); for (const row of sessionRows) lines.push(`- ${row.ts} ${row.project}: ${clip(row.summary || row.snippet || row.kind, 160)}`); }
+  return lines.join('\n');
+}
+function memoryUi(filter = 'all') {
+  syncMarkdown();
+  const memories = loadStore().memories.filter(m => {
+    if (filter === 'all') return true;
+    if (filter === 'on' || filter === 'enabled') return m.status !== 'disabled';
+    if (filter === 'off' || filter === 'disabled') return m.status === 'disabled';
+    if (filter === 'user') return m.domain === 'user';
+    if (filter === 'memory') return m.domain === 'memory';
+    return true;
+  });
+  if (!memories.length) return '没有记忆。';
+  return memories.map((m, i) => {
+    const state = m.status === 'disabled' ? '关闭' : '开启';
+    const file = m.domain === 'user' ? 'USER.md' : 'MEMORY.md';
+    return [`[${i + 1}] ${state}  ${m.id}`, `    文件：${file}`, `    范围：${m.scope} / ${m.project}`, `    类型：${m.type}`, `    内容：${m.text}`, `    操作：memory off ${m.id} ｜ memory on ${m.id} ｜ memory delete ${m.id}`].join('\n');
+  }).join('\n\n');
+}
+function setMemory(id, patch) { const store = loadStore(); const m = store.memories.find(x => x.id === id); if (!m) throw new Error(`memory not found: ${id}`); Object.assign(m, patch, { updated: nowIso() }); saveStore(store); return m; }
+function deleteMemory(id) { const store = loadStore(); const before = store.memories.length; store.memories = store.memories.filter(x => x.id !== id); if (store.memories.length === before) throw new Error(`memory not found: ${id}`); saveStore(store); return { deleted: id }; }
+function addMemory(text, domain = 'user') {
+  const candidate = { domain: domain === 'memory' ? 'memory' : 'user', type: domain === 'memory' ? 'manual' : 'preference', scope: domain === 'memory' ? 'project' : 'global', project: domain === 'memory' ? stableProject(process.cwd()) : 'global', text: cleanMemoryText(redact(text)), confidence: 1, evidence: 'manual memory command', evidence_event_ids: [] };
+  return upsertMemory(candidate, { cwd: process.cwd() });
+}
+function handleMemoryCommand(args) {
+  const action = args[0] || 'list'; const id = args[1];
+  if (action === 'list' || action === 'ls') return memoryUi(args[1] || 'all');
+  if (action === 'on' || action === 'enable') return JSON.stringify(setMemory(id, { status: 'enabled' }), null, 2);
+  if (action === 'off' || action === 'disable') return JSON.stringify(setMemory(id, { status: 'disabled' }), null, 2);
+  if (action === 'delete' || action === 'del' || action === 'remove') return JSON.stringify(deleteMemory(id), null, 2);
+  if (action === 'replace' || action === 'edit') return JSON.stringify(setMemory(id, { text: cleanMemoryText(redact(args.slice(2).join(' '))), lastSeen: nowIso() }), null, 2);
+  if (action === 'add') return addMemory(args.slice(1).join(' '), 'user');
+  if (action === 'add-project') return addMemory(args.slice(1).join(' '), 'memory');
+  return '用法：memory [list|on|off|delete|replace|add|add-project] [memory-id/text]';
+}
+
+let __stdinLines = null;
+let __stdinLineIndex = 0;
+function safeReadByte() {
+  const buffer = Buffer.alloc(1);
+  for (;;) {
+    try {
+      const bytes = fs.readSync(0, buffer, 0, 1, null);
+      if (bytes > 0) return buffer.slice(0, bytes).toString('utf8');
+    } catch (error) {
+      if (!error || (error.code !== 'EAGAIN' && error.code !== 'EWOULDBLOCK')) throw error;
+    }
+    sleepMs(20);
+  }
+}
+function askLine(question) {
+  process.stdout.write(question);
+  if (!process.stdin.isTTY) {
+    if (__stdinLines === null) __stdinLines = fs.readFileSync(0, 'utf8').split(/\r?\n/);
+    return (__stdinLines[__stdinLineIndex++] || '').trim();
+  }
+  let line = '';
+  process.stdin.resume();
+  for (;;) {
+    const char = safeReadByte();
+    if (char === '\u0003') process.exit(130);
+    if (char === '\r' || char === '\n') { process.stdout.write('\n'); return line.trim(); }
+    if (char === '\u007f') { line = line.slice(0, -1); continue; }
+    line += char;
+  }
+}
+function memoryCapacity(domain) {
+  return domain === 'user' ? 24000 : 64000;
+}
+function memoryUsage(domain, memories = loadStore().memories) {
+  const enabled = memories.filter(m => m.domain === domain && m.status !== 'disabled');
+  const chars = enabled.reduce((sum, m) => sum + String(m.text || '').length, 0);
+  const limit = memoryCapacity(domain);
+  const percent = limit ? Math.round(chars / limit * 100) : 0;
+  return { chars, limit, percent, count: enabled.length };
+}
+function renderMemoryTable(filter = 'all', query = '') {
+  const store = loadStore();
+  const needle = String(query || '').trim().toLowerCase();
+  const memories = store.memories.filter(m => {
+    if (filter === 'user' && m.domain !== 'user') return false;
+    if (filter === 'memory' && m.domain !== 'memory') return false;
+    if (filter === 'off' && m.status !== 'disabled') return false;
+    if (filter === 'on' && m.status === 'disabled') return false;
+    if (needle && !`${m.text} ${m.project} ${m.type} ${m.id}`.toLowerCase().includes(needle)) return false;
+    return true;
+  });
+  const user = memoryUsage('user', store.memories);
+  const memory = memoryUsage('memory', store.memories);
+  const header = `USER ${user.chars}/${user.limit} ${user.percent}% · MEMORY ${memory.chars}/${memory.limit} ${memory.percent}%`;
+  if (!memories.length) return { memories, header, text: '没有匹配记忆。' };
+  const text = memories.map((m, i) => {
+    const state = m.status === 'disabled' ? 'off' : 'on ';
+    const file = m.domain === 'user' ? 'USER' : 'MEMORY';
+    return `${String(i + 1).padStart(2, ' ')}. [${state}] [${file}] ${m.id}${m.review ? ' ⚠' : ''}\n    ${m.text}\n    ${m.project}`;
+  }).join('\n\n');
+  return { memories, header, text };
+}
+function resolveMemorySelection(memories, input) {
+  const value = String(input || '').trim();
+  if (!value) return null;
+  const index = Number(value);
+  if (Number.isInteger(index) && index >= 1 && index <= memories.length) return memories[index - 1];
+  return memories.find(m => m.id === value || m.id.startsWith(value)) || null;
+}
+function clearScreen() {
+  if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
+}
+const ANSI = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m', cyan: '\x1b[36m', blue: '\x1b[34m', magenta: '\x1b[35m', green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m', gray: '\x1b[90m', inverse: '\x1b[7m' };
+function style(text, code) { return process.stdout.isTTY ? `${code}${text}${ANSI.reset}` : text; }
+function truncatePad(text, width) {
+  const value = String(text || '');
+  const chars = [...value];
+  if (chars.length > width) return chars.slice(0, Math.max(0, width - 1)).join('') + '…';
+  return value + ' '.repeat(Math.max(0, width - chars.length));
+}
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+function readKey() {
+  if (!process.stdin.isTTY) {
+    if (__stdinLines === null) __stdinLines = fs.readFileSync(0, 'utf8').split(/\r?\n/);
+    const line = (__stdinLines[__stdinLineIndex++] || '').trim();
+    if (line === 'UP') return 'up';
+    if (line === 'DOWN') return 'down';
+    if (line === 'LEFT') return 'left';
+    if (line === 'RIGHT') return 'right';
+    if (line === '') return 'enter';
+    return line;
+  }
+  const buffer = Buffer.alloc(16);
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  let bytes = 0;
+  try {
+    for (;;) {
+      try {
+        bytes = fs.readSync(0, buffer, 0, buffer.length, null);
+        if (bytes > 0) break;
+      } catch (error) {
+        if (!error || (error.code !== 'EAGAIN' && error.code !== 'EWOULDBLOCK')) throw error;
+      }
+      sleepMs(20);
+    }
+  } finally {
+    process.stdin.setRawMode(false);
+  }
+  const key = buffer.slice(0, bytes).toString('utf8');
+  if (key === '\u0003') process.exit(130);
+  if (key === '\r' || key === '\n') return 'enter';
+  if (key === '\u001b[A') return 'up';
+  if (key === '\u001b[B') return 'down';
+  if (key === '\u001b[D') return 'left';
+  if (key === '\u001b[C') return 'right';
+  if (key === '\u007f' || key === '\u001b') return 'left';
+  return key.toLowerCase();
+}
+function promptLine(question) {
+  process.stdout.write(question);
+  if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  return askLine('');
+}
+function statusBadge(memory) {
+  return memory.status === 'disabled' ? '○ 关闭' : '● 开启';
+}
+function domainLabel(memory) {
+  return memory.domain === 'user' ? 'USER 用户偏好' : 'MEMORY 项目记忆';
+}
+function pill(text, color = ANSI.cyan) { return style(` ${text} `, color + ANSI.bold); }
+function printBoxTitle(title) {
+  const width = 68;
+  const brand = `${style('✦ Horizon Context Memory', ANSI.bold + ANSI.cyan)} ${style('memory cockpit', ANSI.dim)} ${style('›', ANSI.gray)} ${style(title, ANSI.bold)}`;
+  console.log(style(`\n╭${'─'.repeat(width)}╮`, ANSI.gray));
+  console.log(style('│ ', ANSI.gray) + truncatePad(brand, width - 2) + style(' │', ANSI.gray));
+  console.log(style(`╰${'─'.repeat(width)}╯`, ANSI.gray));
+}
+function progressBar(percent, width = 16) {
+  const safe = Math.max(0, Math.min(100, Number(percent) || 0));
+  const fill = Math.round(width * safe / 100);
+  const color = safe > 85 ? ANSI.red : safe > 65 ? ANSI.yellow : ANSI.green;
+  return `${style('█'.repeat(fill) + '░'.repeat(width - fill), color)} ${safe}%`;
+}
+function menuSelect(title, items, footer = '↑/↓ move · Enter/→ open · ← back · q quit') {
+  let selected = 0;
+  while (true) {
+    clearScreen();
+    printBoxTitle(title);
+    for (const [index, item] of items.entries()) {
+      const marker = index === selected ? style('●', ANSI.cyan) : style('○', ANSI.gray);
+      const line = `${marker} ${item.label}`;
+      console.log(index === selected ? style(line, ANSI.bold) : line);
+      if (item.hint) console.log(style(`    ${item.hint}`, ANSI.dim));
+    }
+    console.log(style(`\n${footer}`, ANSI.dim));
+    const key = readKey();
+    if (key === 'up') selected = (selected - 1 + items.length) % items.length;
+    else if (key === 'down') selected = (selected + 1) % items.length;
+    else if (key === 'enter' || key === 'right') return items[selected];
+    else if (key === 'left') return { action: 'back' };
+    else if (key === 'q') return { action: 'quit' };
+  }
+}
+function printHomeItems() {
+  const store = loadStore();
+  const user = memoryUsage('user', store.memories);
+  const memory = memoryUsage('memory', store.memories);
+  const disabled = store.memories.filter(m => m.status === 'disabled').length;
+  return [
+    { label: `${pill('ALL', ANSI.blue)} 查看全部记忆`, hint: `USER ${user.count} 条 · MEMORY ${memory.count} 条 · OFF ${disabled} 条`, action: 'all' },
+    { label: `${pill('USER', ANSI.magenta)} 用户偏好`, hint: `${user.chars}/${user.limit} 字 · ${progressBar(user.percent)}`, action: 'user' },
+    { label: `${pill('MEMORY', ANSI.cyan)} 项目记忆`, hint: `${memory.chars}/${memory.limit} 字 · ${progressBar(memory.percent)}`, action: 'memory' },
+    { label: `${pill('FIND', ANSI.green)} 搜索记忆`, hint: '在 USER / MEMORY 中搜索', action: 'search-memory' },
+    { label: `${pill('HISTORY', ANSI.green)} 搜索历史会话`, hint: 'SQLite FTS5 session search', action: 'search-session' },
+    { label: `${pill('NEW', ANSI.yellow)} 新增记忆`, action: 'add' },
+    { label: `${pill('TUNE', ANSI.yellow)} 规则整理 / 去重`, action: 'consolidate' },
+    { label: `${pill('AI', ANSI.magenta)} LLM 复核 / 合并建议`, hint: '使用 Codex exec 语义判断记忆质量', action: 'llm-review' },
+    { label: `${pill('AUTO', ANSI.magenta)} 切换后台 LLM 复核`, hint: config().autoLlmReview ? '当前：开启' : '当前：关闭', action: 'toggle-auto' },
+    { label: `${pill('DOCTOR', ANSI.green)} 健康检查`, action: 'health' },
+    { label: `${pill('SYS', ANSI.blue)} 查看系统状态`, action: 'status' },
+    { label: `${pill('QUIT', ANSI.gray)} 退出`, action: 'quit' }
+  ];
+}
+function memoryRows(filter = 'all', query = '') {
+  return renderMemoryTable(filter, query).memories;
+}
+function browseMemories(filter, title, query = '') {
+  while (true) {
+    const rows = memoryRows(filter, query);
+    if (!rows.length) {
+      const result = menuSelect(title, [{ label: '没有匹配记忆，返回', action: 'back' }]);
+      return;
+    }
+    const items = rows.map(memory => ({
+      label: `${memory.status === 'disabled' ? pill('OFF', ANSI.gray) : pill('ON', ANSI.green)} ${memory.domain === 'user' ? pill('USER', ANSI.magenta) : pill('MEMORY', ANSI.cyan)} ${memory.id}${memory.review ? ' ' + pill('REVIEW', ANSI.yellow) : ''}`,
+      hint: `${clip(memory.text, 76)} · ${memory.project}`,
+      action: 'detail',
+      memory
+    })).concat([{ label: '返回', action: 'back' }]);
+    const selected = menuSelect(title + (query ? ` · 搜索：${query}` : ''), items);
+    if (selected.action === 'quit') process.exit(0);
+    if (selected.action === 'back') return;
+    if (selected.memory) memoryDetail(selected.memory);
+  }
+}
+function memoryDetail(memory) {
+  while (true) {
+    const items = [
+      { label: `${memory.text}`, hint: `${statusBadge(memory)} · ${domainLabel(memory)} · ${memory.project}`, action: 'noop' },
+      { label: `${pill('TOGGLE', ANSI.green)} 开启 / 关闭`, action: 'toggle' },
+      { label: `${pill('EDIT', ANSI.yellow)} 替换内容`, action: 'edit' },
+      { label: `${pill('DELETE', ANSI.red)} 删除`, action: 'delete' },
+      { label: `${pill('REVIEW', ANSI.yellow)} 清除复核标记`, action: 'clear-review' },
+      { label: `${pill('BACK', ANSI.gray)} 返回`, action: 'back' }
+    ];
+    const selected = menuSelect(`记忆详情 ${memory.id}`, items);
+    if (selected.action === 'quit') process.exit(0);
+    if (selected.action === 'back') return;
+    if (selected.action === 'noop') continue;
+    if (selected.action === 'toggle') memory = setMemory(memory.id, { status: memory.status === 'disabled' ? 'enabled' : 'disabled' });
+    if (selected.action === 'edit') {
+      const text = promptLine('新内容：');
+      if (text) memory = setMemory(memory.id, { text: cleanMemoryText(redact(text)), lastSeen: nowIso() });
+    }
+    if (selected.action === 'delete') {
+      const confirm = promptLine(`确认删除 ${memory.id}？输入 yes：`);
+      if (confirm === 'yes') { deleteMemory(memory.id); return; }
+    }
+    if (selected.action === 'clear-review') memory = setMemory(memory.id, { review: undefined });
+  }
+}
+function addMemoryFlow() {
+  const target = menuSelect('新增记忆', [
+    { label: 'USER 用户偏好', action: 'user' },
+    { label: 'MEMORY 项目规则 / 流程', action: 'memory' },
+    { label: '返回', action: 'back' }
+  ]);
+  if (target.action === 'back' || target.action === 'quit') return;
+  const text = promptLine('内容：');
+  if (text) addMemory(text, target.action === 'memory' ? 'memory' : 'user');
+}
+function sessionSearchFlow() {
+  clearScreen();
+  printBoxTitle('搜索历史会话');
+  const query = promptLine('关键词：');
+  if (!query) return;
+  const rows = searchSessions(query, 15);
+  const items = rows.length
+    ? rows.map(row => ({ label: `${row.ts} ${row.project}`, hint: row.summary || row.snippet || row.kind, action: 'back' }))
+    : [{ label: '没有匹配结果', action: 'back' }];
+  items.push({ label: '返回', action: 'back' });
+  menuSelect(`历史会话：${query}`, items, '↑/↓ 查看 · Enter/← 返回 · q 退出');
+}
+
+function memorySearchFlow() {
+  clearScreen();
+  printBoxTitle('搜索记忆');
+  const query = promptLine('关键词：');
+  if (!query) return;
+  browseMemories('all', '搜索记忆', query);
+}
+
+function showJsonScreen(title, value) {
+  clearScreen();
+  printBoxTitle(title);
+  const text = JSON.stringify(value, null, 2).split('\n');
+  for (const line of text) console.log(line);
+  promptLine('\n回车返回');
+}
+
+function memoryCli() {
+  while (true) {
+    syncMarkdown();
+    const selected = menuSelect('HCM Manager', printHomeItems());
+    if (selected.action === 'quit') return;
+    if (selected.action === 'all') browseMemories('all', '全部记忆');
+    else if (selected.action === 'user') browseMemories('user', 'USER 用户偏好');
+    else if (selected.action === 'memory') browseMemories('memory', 'MEMORY 项目记忆');
+    else if (selected.action === 'search-memory') memorySearchFlow();
+    else if (selected.action === 'search-session') sessionSearchFlow();
+    else if (selected.action === 'add') addMemoryFlow();
+    else if (selected.action === 'consolidate') showJsonScreen('整理结果', consolidateMemories());
+    else if (selected.action === 'llm-review') showJsonScreen('LLM 复核结果', llmReviewMemories({}));
+    else if (selected.action === 'toggle-auto') showJsonScreen('后台 LLM 复核', setConfigValue('autoLlmReview', !config().autoLlmReview));
+    else if (selected.action === 'health') showJsonScreen('健康检查', healthCheck());
+    else if (selected.action === 'status') showJsonScreen('系统状态', status());
+  }
+}
+
+function handleHook() {
+  const payload = readStdinJson(); const cfg = config(); if (!cfg.enabled) return;
+  if (process.env.HCM_LLM_REVIEW === '1') return; const event = payloadEvent(payload); const cwd = payload.cwd || process.cwd();
+  if (event === 'SessionStart') { recordEvent('session-start', payload, { summary: `Session started in ${stableProject(cwd)}` }); if (cfg.injectSessionContext) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context(cwd, '') } }) + '\n'); return; }
+  if (event === 'UserPromptSubmit') { const prompt = redact(clip(payloadPrompt(payload), cfg.maxPromptChars || 1200), cfg); const promptEvent = cfg.capturePrompts && prompt ? recordEvent('prompt', payload, { prompt, summary: prompt }) : null; applyCorrectionSignal(payload, prompt, promptEvent); for (const c of classifyMemory(payload, prompt)) upsertMemory({ ...c, evidence_event_ids: promptEvent?.event_id ? [promptEvent.event_id] : [] }, payload); if (cfg.injectSessionContext) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: context(cwd, prompt) } }) + '\n'); return; }
+  if (event === 'PreToolUse' || event === 'PostToolUse') { if (!cfg.captureToolEvents) return; const tool = String(payload.tool_name || payload.toolName || payload.tool || '').trim() || 'tool'; const input = redact(clip(JSON.stringify(payload.tool_input || payload.input || payload.toolInput || {}), cfg.maxToolInputChars || 1200), cfg); const output = redact(clip(JSON.stringify(payload.tool_output || payload.output || payload.toolOutput || {}), cfg.maxToolOutputChars || 1200), cfg); recordEvent(event === 'PreToolUse' ? 'pre-tool' : 'post-tool', payload, { tool, summary: `${event}: ${tool}`, input, output }); return; }
+  if (event === 'Stop') { const last = redact(clip(payload.last_assistant_message || payload.lastAssistantMessage || '', 1000), cfg); recordEvent('stop', payload, { summary: last ? `Turn stopped: ${last}` : 'Turn stopped' }); mineRecurringPatterns(payload); consolidateMemories(); maybeAutoLlmReview(); }
+}
+
+function autoReviewDue() {
+  const cfg = config();
+  if (cfg.autoLlmReview !== true) return { due: false, reason: 'disabled' };
+  const state = readJson(AUTO_STATE, {});
+  const events = readJsonlFiles(path.join(DATA, 'events'), 14);
+  const memories = loadStore().memories;
+  const last = Date.parse(state.lastLlmReviewAt || 0) || 0;
+  const minIntervalMs = Math.max(1, Number(cfg.autoLlmReviewIntervalHours || 24)) * 3600000;
+  const eventDelta = events.length - Number(state.lastEventCount || 0);
+  const memoryDelta = memories.length - Number(state.lastMemoryCount || 0);
+  if (Date.now() - last < minIntervalMs && eventDelta < Number(cfg.autoLlmReviewEventThreshold || 20) && memoryDelta < Number(cfg.autoLlmReviewMemoryThreshold || 5)) {
+    return { due: false, reason: 'not-due', eventDelta, memoryDelta };
+  }
+  return { due: true, eventDelta, memoryDelta };
+}
+function maybeAutoLlmReview() {
+  const due = autoReviewDue();
+  if (!due.due) return due;
+  const result = llmReviewMemories({ timeoutMs: 180000 });
+  const events = readJsonlFiles(path.join(DATA, 'events'), 14);
+  const memories = loadStore().memories;
+  writeJson(AUTO_STATE, { lastLlmReviewAt: nowIso(), lastEventCount: events.length, lastMemoryCount: memories.length, lastResult: result });
+  return { due: true, result };
+}
+
+function memoryQuality(memory) {
+  const text = String(memory.text || '');
+  let score = 100;
+  const reasons = [];
+  if (text.length < 8) { score -= 35; reasons.push('too_short'); }
+  if (text.length > 220) { score -= 20; reasons.push('too_long'); }
+  if (/这次|临时|暂时|今天先|for now|temporary/i.test(text)) { score -= 45; reasons.push('temporary_signal'); }
+  if (isSensitive(text)) { score -= 80; reasons.push('sensitive_signal'); }
+  if (!/[。.!！?？]$/.test(text)) { score -= 5; reasons.push('not_sentence_like'); }
+  if (memory.expiresAt && Date.parse(memory.expiresAt) < Date.now()) { score -= 50; reasons.push('expired'); }
+  if (memory.review) { score -= 20; reasons.push('review_flag'); }
+  return { score: Math.max(0, Math.min(100, score)), reasons };
+}
+
+function healthCheck() {
+  syncMarkdown();
+  const store = loadStore();
+  const issues = [];
+  if (!fs.existsSync(USER_MD)) issues.push('USER.md missing');
+  if (!fs.existsSync(MEMORY_MD)) issues.push('MEMORY.md missing');
+  if (!SQLiteSync) issues.push('node:sqlite unavailable');
+  const ids = new Set();
+  for (const memory of store.memories) {
+    if (ids.has(memory.id)) issues.push(`duplicate id ${memory.id}`);
+    ids.add(memory.id);
+    if (!memory.text || memory.text.length < 4) issues.push(`short memory ${memory.id}`);
+    if (isSensitive(memory.text)) issues.push(`sensitive-looking memory ${memory.id}`);
+    if (!['user', 'memory'].includes(memory.domain)) issues.push(`bad domain ${memory.id}`);
+    const quality = memoryQuality(memory);
+    if (quality.score < 60) issues.push(`low quality ${memory.id}: ${quality.reasons.join(',')}`);
+  }
+  const rebuilt = rebuildIndex();
+  return { ok: issues.length === 0, issues, memories: store.memories.length, lowQuality: store.memories.filter(m => memoryQuality(m).score < 60).length, rebuiltIndex: rebuilt };
+}
+
+
+function setConfigValue(key, value) {
+  const cfg = readJson(CONFIG_PATH, {});
+  cfg[key] = value;
+  writeJson(CONFIG_PATH, cfg);
+  return { key, value };
+}
+
+function evolveOnce() {
+  const payload = { cwd: process.cwd(), source: 'manual-evolve' };
+  const mined = mineRecurringPatterns(payload);
+  const consolidated = consolidateMemories();
+  const autoReview = maybeAutoLlmReview();
+  return { ok: true, mined, consolidated, autoReview };
+}
+function status() { syncMarkdown(); const events = readJsonlFiles(path.join(DATA, 'events')); const memories = loadStore().memories; return { root: ROOT, enabled: config().enabled, autoPromoteMemories: config().autoPromoteMemories, autoMineMemoryCandidates: config().autoMineMemoryCandidates !== false, events: events.length, memories: memories.length, userMemories: memories.filter(m => m.domain === 'user' && m.status !== 'disabled').length, projectMemories: memories.filter(m => m.domain === 'memory' && m.status !== 'disabled').length, disabledMemories: memories.filter(m => m.status === 'disabled').length, reviewNeeded: memories.filter(m => m.review).length, candidateMemories: memories.filter(m => m.review === 'auto-candidate').length, cleanupSuggested: memories.filter(m => lifecycleAudit(m).cleanup).length, lowQuality: memories.filter(m => memoryQuality(m).score < 60).length, sessionDb: SESSION_DB, sqlite: Boolean(SQLiteSync), autoState: readJson(AUTO_STATE, {}), userFile: USER_MD, memoryFile: MEMORY_MD }; }
+function installSkill(proposalFile) { const text = fs.readFileSync(proposalFile, 'utf8'); const match = text.match(/```markdown\n([\s\S]*?)\n```/); if (!match) throw new Error('proposal does not contain Proposed SKILL.md fenced block'); const name = (match[1].match(/name:\s*([^\n]+)/)?.[1] || path.basename(proposalFile, '.md')).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'skill'; const dir = path.join(INSTALLED_SKILLS, name); ensureDir(dir); const out = path.join(dir, 'SKILL.md'); if (fs.existsSync(out)) throw new Error(`skill already exists: ${out}`); fs.writeFileSync(out, match[1]); return out; }
+function review() { ensureDir(PROPOSALS); const files = fs.readdirSync(PROPOSALS).filter(n => n.endsWith('.md')).sort().map(n => path.join(PROPOSALS, n)); return files.length ? files.map((f, i) => `${i + 1}. ${f}`).join('\n') : 'No pending Horizon Context Memory skill proposals.'; }
+function main() {
+  ensureDir(DATA); ensureDir(PROPOSALS);
+  const [cmd, ...args] = process.argv.slice(2);
+  try {
+    if (cmd === 'hook') return handleHook();
+    if (cmd === 'status') return console.log(JSON.stringify(status(), null, 2));
+    if (cmd === 'context') return console.log(context(args[0] || process.cwd(), args.slice(1).join(' ')));
+    if (cmd === 'search') return console.log(searchSessions(args.join(' '), 20).map((r, i) => `${i + 1}. ${r.ts} ${r.project} ${r.summary || r.snippet || r.kind}`).join('\n') || 'No session matches.');
+    if (cmd === 'reindex') return console.log(JSON.stringify(rebuildIndex(), null, 2));
+    if (cmd === 'consolidate') return console.log(JSON.stringify(consolidateMemories(), null, 2));
+    if (cmd === 'evolve') return console.log(JSON.stringify(evolveOnce(), null, 2));
+    if (cmd === 'llm-review') return console.log(JSON.stringify(llmReviewMemories({ verbose: args.includes('--verbose'), dryRun: args.includes('--dry-run') }), null, 2));
+    if (cmd === 'auto-review') return console.log(JSON.stringify(maybeAutoLlmReview(), null, 2));
+    if (cmd === 'health') return console.log(JSON.stringify(healthCheck(), null, 2));
+    if (cmd === 'auto-on') return console.log(JSON.stringify(setConfigValue('autoLlmReview', true), null, 2));
+    if (cmd === 'auto-off') return console.log(JSON.stringify(setConfigValue('autoLlmReview', false), null, 2));
+    if (cmd === 'memory-ui' || cmd === 'memui') return memoryCli();
+    if (cmd === 'memory' || cmd === 'memories') return console.log(handleMemoryCommand(args));
+    if (cmd === 'remember') return console.log(addMemory(args.join(' '), 'user'));
+    if (cmd === 'review') return console.log(review());
+    if (cmd === 'install-skill') return console.log(installSkill(args[0]));
+    console.log('Horizon Context Memory commands:\n  status\n  context [cwd] [query]\n  search <query>\n  reindex\n  consolidate\n  llm-review\n  memory-ui\n  memory [list|on|off|delete|replace|add|add-project] [memory-id/text]\n  review\n  install-skill <proposal-file>');
+  } catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exitCode = 1; }
+}
+main();
