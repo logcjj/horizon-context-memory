@@ -2,10 +2,22 @@
 ROOT="${HCM_HOME:-$HOME/.codex/hcm}"
 LINE='export PATH="${HCM_HOME:-$HOME/.codex/hcm}/bin:$PATH"'
 SHELL_RC="$HOME/.zshrc"
-if [ -f "$SHELL_RC" ] && grep -Fq '.codex/hcm/bin' "$SHELL_RC"; then
-  echo "PATH already configured in $SHELL_RC"
-else
-  printf '\n# Horizon Context Memory memory manager\n%s\n' "$LINE" >> "$SHELL_RC"
-  echo "Added hcm to PATH in $SHELL_RC. Restart terminal or run:"
-  echo "$LINE"
+if [ -f "$SHELL_RC" ]; then
+  SHELL_RC="$SHELL_RC" node <<'NODE'
+const fs = require('fs');
+const file = process.env.SHELL_RC;
+const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+const out = [];
+for (let index = 0; index < lines.length; index += 1) {
+  const line = lines[index];
+  if (line.includes('hermes-codex/bin')) continue;
+  if (line.includes('Horizon Context Memory memory manager')) continue;
+  if (/\.codex\/hcm.*\/bin/.test(line)) continue;
+  out.push(line);
+}
+fs.writeFileSync(file, out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '') + '\n');
+NODE
 fi
+printf '\n# Horizon Context Memory memory manager\n%s\n' "$LINE" >> "$SHELL_RC"
+echo "Configured hcm PATH in $SHELL_RC. Restart terminal or run:"
+echo "$LINE"
