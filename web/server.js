@@ -519,6 +519,17 @@ const server = http.createServer(async (req, res) => {
     saveStore(store);
     return send(res, 200, { ok: true, memory });
   }
+  if (req.method === 'POST' && url.pathname === '/api/memory/purge-disabled') {
+    const store = loadStore();
+    const disabled = store.memories.filter(m => m.status === 'disabled');
+    if (!disabled.length) return send(res, 200, { ok: true, deleted: 0, ids: [] });
+    const backup = backupStore();
+    const ids = new Set(disabled.map(m => m.id));
+    store.memories = store.memories.filter(m => !ids.has(m.id));
+    for (const memory of disabled) appendAudit('purge-disabled', { id: memory.id, before: memory, backup });
+    saveStore(store);
+    return send(res, 200, { ok: true, deleted: disabled.length, ids: [...ids], backup });
+  }
   const match = url.pathname.match(/^\/api\/memory\/([^/]+)$/);
   if (match && req.method === 'PATCH') {
     const id = match[1];

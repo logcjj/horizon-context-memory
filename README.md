@@ -25,7 +25,7 @@ The goal is not to store everything. The goal is to make memory useful: selectiv
 | Memory capture | Hook-based event capture for prompts, sessions, tool activity, workflows, project rules, preferences, and failure lessons. |
 | Memory quality | Confidence scoring, lifecycle hints, low-quality detection, duplicate cleanup, and pending review buckets. |
 | Deep recall | A large local pool with bounded per-turn injection so recall stays relevant instead of noisy. |
-| Web cockpit | Search, filters, details, evidence, editing, enable/disable, delete, batch review, and one-click ZIP export. |
+| Web cockpit | Search, filters, details, evidence, editing, enable/disable, delete, disabled-memory purge, batch review, and one-click ZIP export. |
 | Safety | Local-only storage, advisory memories, sensitive-value blocking, audit trail, backups, and reversible cleanup. |
 | Portability | `hcm-memory-export-*.zip` contains the memory store, markdown mirrors, audit log, events, backups, config, and skill proposals. |
 
@@ -54,6 +54,8 @@ http://127.0.0.1:38987
 Daily usage is intentionally web-first. The top-level views are `All`, `USER`, `MEMORY`, and `Pending`.
 
 `USER` memories are cross-project preferences. `MEMORY` stores project and workflow knowledge. `Pending` collects disabled memories, review candidates, low-quality items, cleanup suggestions, and conflicts.
+
+Use **删除关闭记忆** to purge all disabled memories after confirmation. HCM creates a local backup first and records each removed memory in the audit log.
 
 Use **导出 ZIP** in the cockpit to export a portable archive for migration or backup. The export is generated locally and is downloaded by the browser; no memory data is uploaded.
 
@@ -102,7 +104,7 @@ flowchart LR
 | Quality scoring and pending buckets | Done |
 | Ranked recall context | Done |
 | Search and evidence inspection | Done |
-| Enable, disable, edit, delete, and batch actions | Done |
+| Enable, disable, edit, delete, disabled-memory purge, and batch actions | Done |
 | Audit restore and automatic backups | Done |
 | Legacy `hermes-codex` data migration | Done |
 | Idempotent `hcm` startup when the server is already running | Done |
@@ -144,7 +146,7 @@ See `ARCHITECTURE.md` for the implementation model.
 
 ## Safety Model
 
-HCM treats memory as advisory context, not verified truth. Repository facts should still be checked against current files before action. Sensitive-looking values are blocked or redacted by the capture layer. Destructive review suggestions disable memories first instead of hard-deleting them. Exported ZIP archives may contain private local memory data and should be treated as sensitive.
+HCM treats memory as advisory context, not verified truth. Repository facts should still be checked against current files before action. Sensitive-looking values are blocked or redacted by the capture layer. Destructive review suggestions disable memories first instead of hard-deleting them. The web purge action only removes disabled memories, creates a local backup first, and keeps audit entries for recovery review. Exported ZIP archives may contain private local memory data and should be treated as sensitive.
 
 ## Status
 
